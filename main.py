@@ -2,13 +2,18 @@
 """
 VC Market Sentiment Agent
 
-Searches X (Twitter) and LinkedIn for recent VC funding activity, then uses
-Claude Opus 4.6 to synthesize findings into a structured market intelligence report.
+Searches X (Twitter) and LinkedIn for VC funding activity over the last 15 days,
+then uses Claude Opus 4.6 to synthesize findings — including how sentiment has
+evolved across the period — into a structured market intelligence report.
 
 Setup:
     cp .env.example .env   # fill in your credentials
     pip install -r requirements.txt
     python main.py
+
+Schedule (every 15 days via cron):
+    Run `crontab -e` and add:
+    0 8 1,16 * * cd /path/to/vc-sentiment-agent && /usr/bin/env python3 main.py
 """
 
 import os
@@ -28,7 +33,11 @@ load_dotenv()
 # Find alternative LinkedIn actors at apify.com/store → search "LinkedIn posts"
 LINKEDIN_ACTOR_ID = "apify/linkedin-post-search-scraper"
 
+WINDOW_DAYS = 15  # Analysis window in days
+
 TODAY = datetime.now().strftime("%B %d, %Y")
+START_DATE = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime("%B %d")
+MID_DATE = (datetime.now() - timedelta(days=WINDOW_DAYS // 2)).strftime("%B %d")
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -42,16 +51,19 @@ def search_x_posts(query: str, max_results: int = 50) -> str:
     Supports standard Twitter operators: #hashtag, "exact phrase", from:username.
     Do NOT include -is:retweet in your query — it is added automatically.
 
+    NOTE: X API Basic tier caps recent search at 7 days regardless of start_time.
+    For the full 15-day window on X, Pro tier ($5k/mo) is required.
+
     Args:
         query: Twitter search query string.
-        max_results: Number of posts to return (10–100).
+        max_results: Number of posts to return (10-100).
     """
     bearer_token = os.environ.get("X_BEARER_TOKEN", "")
     if not bearer_token:
         return "Error: X_BEARER_TOKEN not set."
 
     start_time = (
-        datetime.now(timezone.utc) - timedelta(days=7)
+        datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
@@ -81,7 +93,7 @@ def search_x_posts(query: str, max_results: int = 50) -> str:
 
     users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
 
-    lines = [f"**X Posts** — `{query}` ({len(tweets)} results, last 7 days)\n"]
+    lines = [f"**X Posts** — `{query}` ({len(tweets)} results, last {WINDOW_DAYS} days)\n"]
     for tweet in tweets:
         author = users.get(tweet.get("author_id", ""), {})
         m = tweet.get("public_metrics", {})
@@ -134,9 +146,12 @@ def search_linkedin_posts(keywords: str, max_posts: int = 25) -> str:
         author = item.get("author", {})
         # Different Apify actors use different field names — handle both
         text = (item.get("text") or item.get("content") or item.get("commentary") or "")[:600]
+        # Include post date when available to support temporal analysis
+        post_date = item.get("postedAt") or item.get("date") or item.get("publishedAt") or ""
         lines.append(
             f"{author.get('name', 'Unknown')} — {author.get('headline', '')[:80]}\n"
-            f"Likes: {item.get('likesCount', 0)} · Comments: {item.get('commentsCount', 0)}\n"
+            f"Likes: {item.get('likesCount', 0)} · Comments: {item.get('commentsCount', 0)}"
+            + (f" · Posted: {post_date}" if post_date else "") + "\n"
             f"{text}\n"
             "---"
         )
@@ -146,14 +161,19 @@ def search_linkedin_posts(keywords: str, max_posts: int = 25) -> str:
 # ── System Prompt ──────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = f"""You are a venture capital market intelligence analyst. Your job is to search \
-X (Twitter) and LinkedIn for recent posts from VCs, investors, and founders, then synthesize \
-your findings into a comprehensive market sentiment report.
+X (Twitter) and LinkedIn for posts from VCs, investors, and founders over the last {WINDOW_DAYS} days, \
+then synthesize your findings into a comprehensive report that captures both the current state \
+AND how sentiment has evolved across the period.
 
-Today: {TODAY} | Data window: last 7 days
+Today: {TODAY}
+Analysis window: {START_DATE} → {TODAY} ({WINDOW_DAYS} days)
+Midpoint: ~{MID_DATE} (use to distinguish early-period vs recent signals)
 
 ## Research Strategy
 
-Run at least 3–4 searches per platform (6–8 total) across different angles before writing the report.
+Run at least 3-4 searches per platform (6-8 total) across different angles. Pay attention to \
+post timestamps — you need enough data to identify shifts between the early half ({START_DATE}–{MID_DATE}) \
+and the recent half ({MID_DATE}–{TODAY}) of the window.
 
 **Suggested X searches:**
 1. `#venturecapital OR #VCfunding OR #startupfunding` — broad VC activity
@@ -169,44 +189,60 @@ Run at least 3–4 searches per platform (6–8 total) across different angles b
 4. `climate tech venture capital investing` — growing sector
 5. `venture capital market trends outlook` — macro sentiment
 
-After gathering sufficient data, write the complete Markdown report as your final response.
+After gathering data, write the complete Markdown report as your final response.
 
 ## Output Format
 
-Your final response must be the complete report in this structure:
+Your final response must be the complete report in this exact structure:
 
 # VC Market Sentiment Report — {TODAY}
+*Analysis window: {START_DATE} – {TODAY}*
 
 ## Executive Summary
-[3–4 sentences: what's happening in VC right now]
+[3-4 sentences covering the current state AND the directional arc of the past {WINDOW_DAYS} days]
 
 ## Overall Market Sentiment
 **Verdict:** [Bullish / Cautiously Bullish / Neutral / Cautiously Bearish / Bearish]
+**Direction:** [Improving / Stable / Deteriorating] vs. the start of the window
 [Evidence-backed explanation citing specific posts or patterns]
 
+## Sentiment Evolution ({START_DATE} → {TODAY})
+[This is the core temporal analysis. Split the window into two halves and describe what changed:
+- **Early period ({START_DATE}–{MID_DATE}):** dominant tone, themes, and deal activity
+- **Recent period ({MID_DATE}–{TODAY}):** how sentiment shifted, what accelerated or cooled
+- **Trajectory:** is momentum building, stalling, or reversing on key themes?]
+
 ## Top Investment Themes
-[Numbered list of 4–6 dominant themes with evidence from collected posts]
+[Numbered list of 4-6 dominant themes. For each, note whether it is gaining, stable, or losing \
+momentum across the 15-day window]
 
 ## Hottest Sectors & Technologies
-[Which sectors are attracting the most capital and excitement, with evidence]
+[Which sectors are attracting the most capital and excitement. Flag any that surged or cooled \
+specifically in the recent half of the window]
 
 ## Notable VC Perspectives
-[Direct quotes or paraphrased views from identifiable investors, with their names/firms]
+[Direct quotes or paraphrased views from identifiable investors, with their names/firms. \
+Note if their tone shifted during the period]
 
 ## Emerging Narratives
-[New themes just starting to gain traction — things mentioned less but growing]
+[New themes that barely appeared in the early period but are gaining traction now]
+
+## Fading Narratives
+[Topics that were prominent early in the window but have cooled or disappeared recently]
 
 ## Cautionary Signals
-[Headwinds, valuation concerns, down rounds, cooling sectors, skepticism]
+[Headwinds, valuation concerns, down rounds, cooling sectors, skepticism. Flag any that are \
+newly appearing vs. persistent throughout the window]
 
-## Key Deals & Announcements Mentioned
-[Specific companies, rounds, or partnerships surfaced in posts]
+## Key Deals & Announcements
+[Specific companies, rounds, or partnerships surfaced in posts. Note approximate timing]
 
 ## Platform Comparison
-[Notable differences in what VCs discuss on X vs LinkedIn]
+[Notable differences in what VCs discuss on X vs LinkedIn over this period]
 
 ## Methodology
-[List the exact search queries used, note data limitations and caveats]
+[List exact search queries used, note that X Basic tier covers ~7 days not full 15, \
+and any other data limitations]
 """
 
 
@@ -214,7 +250,7 @@ Your final response must be the complete report in this structure:
 
 def run_agent() -> str:
     """Run the VC sentiment agent and return the markdown report."""
-    print(f"🚀  VC Sentiment Agent  |  {TODAY}\n" + "=" * 50)
+    print(f"🚀  VC Sentiment Agent  |  {START_DATE} → {TODAY}\n" + "=" * 50)
 
     final_report = ""
 
@@ -227,8 +263,11 @@ def run_agent() -> str:
         messages=[{
             "role": "user",
             "content": (
-                "Please research current VC market sentiment by searching both X and LinkedIn "
-                "(at least 6 searches total), then write the complete market intelligence report."
+                f"Research VC market sentiment for the past {WINDOW_DAYS} days "
+                f"({START_DATE} to {TODAY}). Search both X and LinkedIn (at least 6 searches "
+                "total), paying attention to post timestamps so you can identify how sentiment "
+                "evolved across the period. Then write the complete market intelligence report "
+                "including the temporal evolution analysis."
             ),
         }],
     )
@@ -236,7 +275,6 @@ def run_agent() -> str:
     for message in runner:
         for block in message.content:
             if block.type == "tool_use":
-                # Show first kwarg for a compact progress line
                 first_arg = next(iter(block.input.values()), "")
                 print(f"\n🔍  {block.name}  →  \"{str(first_arg)[:60]}\"")
             elif block.type == "thinking":
@@ -265,13 +303,14 @@ def main():
         print("❌  Agent produced no output. Check your API credentials and quotas.")
         sys.exit(1)
 
-    # Save report
-    filename = f"vc_sentiment_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+    # Save report with date range in filename
+    start_slug = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime("%Y%m%d")
+    today_slug = datetime.now().strftime("%Y%m%d")
+    filename = f"vc_sentiment_{start_slug}_to_{today_slug}.md"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(report)
 
     print(f"📄  Report saved → {filename}\n" + "-" * 50)
-    # Preview first ~800 chars
     preview = report[:800]
     print(preview)
     if len(report) > 800:
